@@ -1,106 +1,197 @@
 import { useState, useEffect, useRef } from 'react'
 import Peer from 'peerjs'
-import ChatSetup from './components/ChatSetup'
-import ChatRoom from './components/ChatRoom'
+import Lobby from './components/Lobby'
+import GameTable from './components/GameTable'
+import { v4 as uuidv4 } from 'uuid'
 import './App.css'
 
 function App() {
-  const [myPeerId, setMyPeerId] = useState('')
-  const [connection, setConnection] = useState(null)
-  const [messages, setMessages] = useState([])
-  const [view, setView] = useState('setup') // 'setup' | 'chat'
-  const [connectionStatus, setConnectionStatus] = useState('disconnected') // disconnected, connecting, connected
+  const [gameState, setGameState] = useState('lobby') // lobby | game | gameover
+  const [isHost, setIsHost] = useState(false)
+  const [roomCode, setRoomCode] = useState('')
+  const [myPlayer, setMyPlayer] = useState(null)
+  const [players, setPlayers] = useState([]) // Array of { id, name, seat, isHost }
+  const playersRef = useRef([]) // Ref to access latest players in callbacks
+
+  const updatePlayers = (newPlayers) => {
+    setPlayers(newPlayers)
+    playersRef.current = newPlayers
+  }
 
   const peerRef = useRef(null)
+  const connectionsRef = useRef({}) // Store connections to other peers
 
-  useEffect(() => {
-    // Initialize Peer
-    const peer = new Peer()
+  // Initialize PeerJS
+  const initializePeer = (id) => {
+    if (peerRef.current) peerRef.current.destroy()
+
+    // Prefix ID to avoid collisions with random users
+    const cleanId = id.replace(/[^a-zA-Z0-9-]/g, '')
+    const peer = new Peer(cleanId)
     peerRef.current = peer
 
-    peer.on('open', (id) => {
-      console.log('My peer ID is: ' + id)
-      setMyPeerId(id)
+    peer.on('open', (peerId) => {
+      console.log('My ID:', peerId)
+      // If host, we are ready. If client, time to connect to host.
     })
 
     peer.on('connection', (conn) => {
-      console.log('Incoming connection from:', conn.peer)
-      handleConnection(conn)
+      handleIncomingConnection(conn)
     })
 
-    return () => {
-      peer.destroy()
+    peer.on('error', (err) => {
+      console.error(err)
+      alert('Peer Connection Error: ' + err.type)
+    })
+  }
+
+  // HOST LOGIC
+  const createRoom = (playerName) => {
+    const code = Math.floor(1000 + Math.random() * 9000).toString()
+    setRoomCode(code)
+    setIsHost(true)
+
+    // Create Host ID: okey101-[CODE]
+    const hostId = `okey101-${code}`
+    initializePeer(hostId)
+
+    const hostPlayer = {
+      id: hostId,
+      name: playerName,
+      seat: 0,
+      isHost: true
     }
-  }, [])
+    setMyPlayer(hostPlayer)
+    updatePlayers([hostPlayer])
+  }
 
-  const handleConnection = (conn) => {
-    setConnection(conn)
-    setConnectionStatus('connecting')
-
+  const handleIncomingConnection = (conn) => {
+    // Only Host should receive unexpected connections in this simple model (or peer-to-peer later)
     conn.on('open', () => {
-      console.log('Connection opened with:', conn.peer)
-      setConnectionStatus('connected')
-      setView('chat')
-      // Send welcome message or just sync
-    })
+      console.log('New connection:', conn.peer)
+      connectionsRef.current[conn.peer] = conn
 
-    conn.on('data', (data) => {
-      console.log('Received data:', data)
-      if (data.type === 'message') {
-        setMessages(prev => [...prev, { text: data.text, sender: 'peer' }])
+      // Wait for JOIN_REQUEST
+      conn.on('data', (data) => {
+        if (data.type === 'JOIN_REQUEST') {
+          handleJoinRequest(conn, data.payload)
+        }
+      })
+    })
+  }
+
+
+  const handleJoinRequest = (conn, { name }) => {
+    const currentPlayers = playersRef.current;
+
+    // Check if room is full
+    if (currentPlayers.length >= 4) {
+      conn.send({ type: 'ERROR', message: 'Room is full' })
+      return
+    }
+
+    // Check if player already exists (re-join)
+    if (currentPlayers.find(p => p.id === conn.peer)) {
+      return;
+    }
+
+    const newPlayer = {
+      id: conn.peer,
+      name,
+      seat: currentPlayers.length, // Simple auto-seat for now
+      isHost: false
+    }
+
+    const updatedPlayers = [...currentPlayers, newPlayer]
+    updatePlayers(updatedPlayers)
+
+    // Broadcast update to ALL (including new player)
+    broadcastPlayers(updatedPlayers)
+  }
+
+  // CLIENT LOGIC
+  const joinRoom = (code, playerName) => {
+    const clientId = `player-${uuidv4().slice(0, 8)}`
+    initializePeer(clientId)
+    setRoomCode(code)
+
+    // Delay slighty to ensure peer is open
+    setTimeout(() => {
+      if (!peerRef.current) return
+
+      const hostId = `okey101-${code}`
+      console.log('Connecting to Host:', hostId)
+      const conn = peerRef.current.connect(hostId)
+
+      conn.on('open', () => {
+        console.log('Connected to Host')
+        conn.send({
+          type: 'JOIN_REQUEST',
+          payload: { name: playerName }
+        })
+      })
+
+      conn.on('data', (data) => {
+        handleClientData(data)
+      })
+
+      conn.on('error', (err) => alert('Connection failed: ' + err))
+
+      setMyPlayer({ id: clientId, name: playerName })
+    }, 1000)
+  }
+
+  const handleClientData = (data) => {
+    if (data.type === 'UPDATE_PLAYERS') {
+      updatePlayers(data.payload)
+    }
+    if (data.type === 'GAME_START') {
+      setGameState('game')
+    }
+  }
+
+  // UTILS
+  const broadcastPlayers = (currentPlayers) => {
+    // Send to all connected clients
+    Object.values(connectionsRef.current).forEach(conn => {
+      if (conn.open) {
+        conn.send({ type: 'UPDATE_PLAYERS', payload: currentPlayers })
       }
     })
+  }
 
-    conn.on('close', () => {
-      console.log('Connection closed')
-      setConnectionStatus('disconnected')
-      setConnection(null)
-      alert('Connection lost')
-      setView('setup')
-      setMessages([])
+  const startGame = () => {
+    setGameState('game')
+    // Broadcast start
+    Object.values(connectionsRef.current).forEach(conn => {
+      conn.send({ type: 'GAME_START' })
     })
-
-    conn.on('error', (err) => {
-      console.error('Connection error:', err)
-      alert('Connection error: ' + err)
-    })
-  }
-
-  const connectToPeer = (targetId) => {
-    if (!peerRef.current) return
-    console.log('Connecting to:', targetId)
-    const conn = peerRef.current.connect(targetId)
-    handleConnection(conn)
-  }
-
-  const sendMessage = (text) => {
-    if (connection && connectionStatus === 'connected') {
-      connection.send({ type: 'message', text })
-      setMessages(prev => [...prev, { text, sender: 'me' }])
-    }
-  }
-
-  const handleViewChange = (newView) => {
-    if (newView === 'setup' && connection) {
-      connection.close()
-    }
-    setView(newView)
   }
 
   return (
-    <div className="App">
-      {view === 'setup' ? (
-        <ChatSetup myPeerId={myPeerId} onConnect={connectToPeer} />
-      ) : (
-        <ChatRoom
-          messages={messages}
-          onViewChange={handleViewChange}
-          onSendMessage={sendMessage}
-          connectionStatus={connectionStatus}
+    <div className="App min-h-screen bg-slate-900 text-white font-sans selection:bg-green-500/30">
+      {gameState === 'lobby' && (
+        <Lobby
+          onCreateRoom={createRoom}
+          onJoinRoom={joinRoom}
+          isHost={isHost}
+          players={players}
+          roomCode={roomCode}
+          onStartGame={startGame}
+          myPeerId={myPlayer?.id}
+        />
+      )}
+
+      {gameState === 'game' && (
+        <GameTable
+          players={players}
+          myPlayer={myPlayer}
+        // onAction={handleGameAction}
         />
       )}
     </div>
   )
 }
+
 
 export default App
